@@ -2,7 +2,7 @@ version: '2'
 
 services:
   vpn:
-    image: hwdsl2/ipsec-vpn-server
+    image: asubbot/ipsec-vpn-server
     restart: always
     env_file:
       - ./vpn.env

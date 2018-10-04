@@ -8,7 +8,7 @@
 # This file is part of IPsec VPN Docker image, available at:
 # https://github.com/hwdsl2/docker-ipsec-vpn-server
 #
-# Copyright (C) 2016-2018 Lin Song <linsongui@gmail.com>
+# Copyright (C) 2016-2017 Lin Song <linsongui@gmail.com>
 # Based on the work of Thomas Sarlandie (Copyright 2012)
 #
 # This work is licensed under the Creative Commons Attribution-ShareAlike 3.0
@@ -68,24 +68,51 @@ fi
 # Remove whitespace and quotes around VPN variables, if any
 VPN_IPSEC_PSK="$(nospaces "$VPN_IPSEC_PSK")"
 VPN_IPSEC_PSK="$(noquotes "$VPN_IPSEC_PSK")"
-VPN_USER="$(nospaces "$VPN_USER")"
-VPN_USER="$(noquotes "$VPN_USER")"
-VPN_PASSWORD="$(nospaces "$VPN_PASSWORD")"
-VPN_PASSWORD="$(noquotes "$VPN_PASSWORD")"
 
-if [ -z "$VPN_IPSEC_PSK" ] || [ -z "$VPN_USER" ] || [ -z "$VPN_PASSWORD" ]; then
-  exiterr "All VPN credentials must be specified. Edit your 'env' file and re-enter them."
+# Check if the muli-user file is speficied in the environment variables and verify that the file exists
+if [ ! -z "$VPN_USER_FILE" ]; then
+   if [ -f "$VPN_USER_FILE" ]; then
+      echo "Multi-User configuration"
+   else
+      exiterr "File with the user and passowrd definitions is not found."
+   fi
 fi
 
-if printf '%s' "$VPN_IPSEC_PSK $VPN_USER $VPN_PASSWORD" | LC_ALL=C grep -q '[^ -~]\+'; then
-  exiterr "VPN credentials must not contain non-ASCII characters."
+if [ -z "$VPN_USER_FILE" ]; then
+  VPN_USER="$(nospaces "$VPN_USER")"
+  VPN_USER="$(noquotes "$VPN_USER")"
+  VPN_PASSWORD="$(nospaces "$VPN_PASSWORD")"
+  VPN_PASSWORD="$(noquotes "$VPN_PASSWORD")"
+
+  if [ -z "$VPN_IPSEC_PSK" ] || [ -z "$VPN_USER" ] || [ -z "$VPN_PASSWORD" ]; then
+    exiterr "All VPN credentials must be specified. Edit your 'env' file and re-enter them."
+  fi
+
+  if printf '%s' "$VPN_IPSEC_PSK $VPN_USER $VPN_PASSWORD" | LC_ALL=C grep -q '[^ -~]\+'; then
+    exiterr "VPN credentials must not contain non-ASCII characters."
+  fi
+
+  case "$VPN_IPSEC_PSK $VPN_USER $VPN_PASSWORD" in
+    *[\\\"\']*)
+      exiterr "VPN credentials must not contain these special characters: \\ \" '"
+      ;;
+  esac
+else
+  while IFS=: read -r VPN_USER VPN_PASSWORD; do
+
+    if printf '%s' "$VPN_USER $VPN_PASSWORD" | LC_ALL=C grep -q '[^ -~]\+'; then
+      exiterr "VPN credentials must not contain non-ASCII characters for user $VPN_USER."
+    fi
+
+    case "$VPN_USER $VPN_PASSWORD" in
+      *[\\\"\']*)
+        exiterr "VPN credentials must not contain these special characters: \\ \" ' for user $VPN_USER"
+        ;;
+    esac
+
+  done < $VPN_USER_FILE
 fi
 
-case "$VPN_IPSEC_PSK $VPN_USER $VPN_PASSWORD" in
-  *[\\\"\']*)
-    exiterr "VPN credentials must not contain these special characters: \\ \" '"
-    ;;
-esac
 
 echo
 echo 'Trying to auto discover IP of this server...'
@@ -131,7 +158,7 @@ conn shared
   dpddelay=30
   dpdtimeout=120
   dpdaction=clear
-  ike=3des-sha1,3des-sha2,aes-sha1,aes-sha1;modp1024,aes-sha2,aes-sha2;modp1024
+  ike=3des-sha1,3des-sha2,aes-sha1,aes-sha1;modp1024,aes-sha2,aes-sha2;modp1024,aes256-sha2_512
   phase2alg=3des-sha1,3des-sha2,aes-sha1,aes-sha2,aes256-sha2_512
   sha2-truncbug=yes
 
@@ -147,7 +174,7 @@ conn xauth-psk
   auto=add
   leftsubnet=0.0.0.0/0
   rightaddresspool=$XAUTH_POOL
-  modecfgdns="$DNS_SRV1, $DNS_SRV2"
+  modecfgdns1=$DNS_SRV1
   leftxauthserver=yes
   rightxauthclient=yes
   leftmodecfgserver=yes
@@ -159,10 +186,6 @@ conn xauth-psk
   cisco-unity=yes
   also=shared
 EOF
-
-if uname -r | grep -qi 'coreos'; then
-  sed -i '/phase2alg/s/,aes256-sha2_512//' /etc/ipsec.conf
-fi
 
 # Specify IPsec PSK
 cat > /etc/ipsec.secrets <<EOF
@@ -203,14 +226,27 @@ connect-delay 5000
 EOF
 
 # Create VPN credentials
-cat > /etc/ppp/chap-secrets <<EOF
+if [ -z "$VPN_USER_FILE" ]; then
+  cat > /etc/ppp/chap-secrets <<EOF
 "$VPN_USER" l2tpd "$VPN_PASSWORD" *
 EOF
 
-VPN_PASSWORD_ENC=$(openssl passwd -1 "$VPN_PASSWORD")
-cat > /etc/ipsec.d/passwd <<EOF
+  VPN_PASSWORD_ENC=$(openssl passwd -1 "$VPN_PASSWORD")
+  cat > /etc/ipsec.d/passwd <<EOF
 $VPN_USER:$VPN_PASSWORD_ENC:xauth-psk
 EOF
+else
+  > /etc/ppp/chap-secrets
+  > /etc/ipsec.d/passwd
+  while IFS=: read -r VPN_USER VPN_PASSWORD; do
+
+    echo \"$VPN_USER\" "l2tpd" \"$VPN_PASSWORD\" "*" >> /etc/ppp/chap-secrets
+    VPN_PASSWORD_ENC=$(openssl passwd -1 "$VPN_PASSWORD")
+    echo "$VPN_USER:$VPN_PASSWORD_ENC:xauth-psk" >> /etc/ipsec.d/passwd
+
+  done < $VPN_USER_FILE
+fi
+
 
 # Update sysctl settings
 SYST='/sbin/sysctl -e -q -w'
@@ -270,9 +306,23 @@ Connect to your new VPN with these details:
 
 Server IP: $PUBLIC_IP
 IPsec PSK: $VPN_IPSEC_PSK
+EOF
+
+if [ -z "$VPN_USER_FILE" ]; then
+  cat <<EOF
 Username: $VPN_USER
 Password: $VPN_PASSWORD
+EOF
+else
+  while IFS=: read -r VPN_USER VPN_PASSWORD; do
+    cat <<EOF
+Username: $VPN_USER Password: $VPN_PASSWORD
+EOF
 
+  done < $VPN_USER_FILE
+fi
+
+cat <<EOF
 Write these down. You'll need them to connect!
 
 Important notes:   https://git.io/vpnnotes2
@@ -282,12 +332,12 @@ Setup VPN clients: https://git.io/vpnclients
 
 EOF
 
-# Load IPsec kernel module
+# Load IPsec NETKEY kernel module
 modprobe af_key
 
 # Start services
-mkdir -p /run/pluto /var/run/pluto /var/run/xl2tpd
-rm -f /run/pluto/pluto.pid /var/run/pluto/pluto.pid /var/run/xl2tpd.pid
+mkdir -p /var/run/pluto /var/run/xl2tpd
+rm -f /var/run/pluto/pluto.pid /var/run/xl2tpd.pid
 
-/usr/local/sbin/ipsec start
+/usr/local/sbin/ipsec start #--config /etc/ipsec.conf
 exec /usr/sbin/xl2tpd -D -c /etc/xl2tpd/xl2tpd.conf
